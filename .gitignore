@@ -1,0 +1,6 @@
+node_modules/
+nextapp/
+dist/
+*.exe
+*.dmg
+*.AppImage

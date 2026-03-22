@@ -1,0 +1,70 @@
+{
+  "name": "legalease-ph-desktop",
+  "version": "1.0.0",
+  "description": "LegalEase PH - Desktop App for Philippine Lawyers",
+  "main": "main.js",
+  "author": "Julius Vidad",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build": "node scripts/build.js",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "ph.legalease.desktop",
+    "productName": "LegalEase PH",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.js",
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "nextapp",
+        "to": "nextapp"
+      }
+    ],
+    "asar": false,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false,
+      "shortcutName": "LegalEase PH"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Office"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "juliusvidad",
+      "repo": "legalease-ph-desktop"
+    }
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3"
+  }
+}
