@@ -101,6 +101,36 @@ if (fs.existsSync(nodeModules)) {
   console.log("  Renamed node_modules -> _modules");
 }
 
+// Step 7: Fix symlinks in next-build/node_modules
+// Next.js creates symlinks in .next/node_modules pointing to the app's node_modules.
+// After renaming node_modules -> _modules, these symlinks break and cause
+// electron-builder's 7zip to fail. Replace them with actual directory copies.
+const nextBuildModules = path.join(nextBuild, "node_modules");
+if (fs.existsSync(nextBuildModules)) {
+  const entries = fs.readdirSync(nextBuildModules);
+  for (const entry of entries) {
+    const entryPath = path.join(nextBuildModules, entry);
+    try {
+      const stat = fs.lstatSync(entryPath);
+      if (stat.isSymbolicLink()) {
+        // Resolve the package name from the symlink entry (e.g. "pdf-parse-abc123" -> "pdf-parse")
+        const target = fs.readlinkSync(entryPath);
+        const pkgName = path.basename(target);
+        const realSource = path.join(modules, pkgName);
+        fs.rmSync(entryPath);
+        if (fs.existsSync(realSource)) {
+          fs.cpSync(realSource, entryPath, { recursive: true });
+          console.log(`  Fixed symlink: ${entry} -> copied from _modules/${pkgName}`);
+        } else {
+          console.log(`  Warning: symlink target not found for ${entry}`);
+        }
+      }
+    } catch {
+      // Not a symlink or inaccessible, skip
+    }
+  }
+}
+
 console.log("\n=== Build complete! ===");
 console.log("Run 'npm run dist:win' to create the Windows installer.");
 console.log("Run 'npm run dist:mac' to create the macOS installer.");
