@@ -1,40 +1,87 @@
 const { app, BrowserWindow, shell, dialog } = require("electron");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const http = require("http");
+const net = require("net");
 const { autoUpdater } = require("electron-updater");
 
-const PORT = 23847; // Random high port to avoid conflicts
+const PORT = 23847;
 let mainWindow = null;
 let serverProcess = null;
 
+// ── Single instance lock (B4 fix) ──────────────────────────────────
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 function getAppPath() {
-  // In production (packaged), the app is in resources/app
-  // In development, it's in ./app
   if (app.isPackaged) {
     return path.join(process.resourcesPath, "nextapp");
   }
   return path.join(__dirname, "nextapp");
 }
 
+// ── Restore renamed dirs (with try/catch for race conditions - B1 fix) ──
 function restorePackagedDirs(appPath) {
-  // electron-builder can't copy dot-dirs or node_modules, so we rename them in the build script
-  // and restore them on first launch
   const fs = require("fs");
 
-  const nextBuild = path.join(appPath, "next-build");
-  const dotNext = path.join(appPath, ".next");
-  if (fs.existsSync(nextBuild) && !fs.existsSync(dotNext)) {
-    fs.renameSync(nextBuild, dotNext);
-    console.log("Restored next-build -> .next");
+  try {
+    const nextBuild = path.join(appPath, "next-build");
+    const dotNext = path.join(appPath, ".next");
+    if (fs.existsSync(nextBuild) && !fs.existsSync(dotNext)) {
+      fs.renameSync(nextBuild, dotNext);
+      console.log("Restored next-build -> .next");
+    }
+  } catch (err) {
+    console.warn("Could not restore .next:", err.message);
   }
 
-  const modules = path.join(appPath, "_modules");
-  const nodeModules = path.join(appPath, "node_modules");
-  if (fs.existsSync(modules) && !fs.existsSync(nodeModules)) {
-    fs.renameSync(modules, nodeModules);
-    console.log("Restored _modules -> node_modules");
+  try {
+    const modules = path.join(appPath, "_modules");
+    const nodeModules = path.join(appPath, "node_modules");
+    if (fs.existsSync(modules) && !fs.existsSync(nodeModules)) {
+      fs.renameSync(modules, nodeModules);
+      console.log("Restored _modules -> node_modules");
+    }
+  } catch (err) {
+    console.warn("Could not restore node_modules:", err.message);
   }
+}
+
+// ── Check if port is available (B3 fix) ─────────────────────────────
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => {
+      server.close();
+      resolve(true);
+    });
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+// ── Kill server process tree (cleanup fix for Windows) ──────────────
+function killServerProcess() {
+  if (!serverProcess) return;
+  try {
+    if (process.platform === "win32") {
+      execSync("taskkill /pid " + serverProcess.pid + " /T /F", { stdio: "ignore" });
+    } else {
+      serverProcess.kill("SIGTERM");
+    }
+  } catch {
+    // Process may already be dead
+  }
+  serverProcess = null;
 }
 
 function startNextServer() {
@@ -44,7 +91,8 @@ function startNextServer() {
     const nextBin = path.join(appPath, "node_modules", ".bin", "next");
     const nextCmd = process.platform === "win32" ? nextBin + ".cmd" : nextBin;
 
-    serverProcess = spawn(nextCmd, ["start", "--port", String(PORT)], {
+    // Bind to localhost only (security fix - prevents LAN exposure)
+    serverProcess = spawn(nextCmd, ["start", "--port", String(PORT), "--hostname", "127.0.0.1"], {
       cwd: appPath,
       env: { ...process.env, NODE_ENV: "production" },
       shell: process.platform === "win32",
@@ -60,7 +108,12 @@ function startNextServer() {
     });
 
     serverProcess.stderr.on("data", (data) => {
-      console.error("[Next.js Error]", data.toString());
+      const errMsg = data.toString();
+      console.error("[Next.js Error]", errMsg);
+      // Detect port conflict (B3 fix)
+      if (errMsg.includes("EADDRINUSE")) {
+        reject(new Error("Port " + PORT + " is already in use. Please close other instances of LegalEase PH."));
+      }
     });
 
     serverProcess.on("error", (err) => {
@@ -68,8 +121,24 @@ function startNextServer() {
       reject(err);
     });
 
+    // B2 fix: Handle server crash after startup
     serverProcess.on("close", (code) => {
       console.log("Next.js server exited with code:", code);
+      if (code !== 0 && code !== null && mainWindow && !mainWindow.isDestroyed()) {
+        dialog
+          .showMessageBox(mainWindow, {
+            type: "error",
+            title: "Server Error",
+            message: "The application server has stopped unexpectedly. The app needs to restart.",
+            buttons: ["Restart", "Quit"],
+          })
+          .then((result) => {
+            if (result.response === 0) {
+              app.relaunch();
+            }
+            app.quit();
+          });
+      }
     });
 
     // Fallback: poll until the server responds
@@ -83,7 +152,7 @@ function startNextServer() {
         return;
       }
       http
-        .get(`http://localhost:${PORT}`, (res) => {
+        .get("http://127.0.0.1:" + PORT, (res) => {
           if (res.statusCode === 200 || res.statusCode === 302 || res.statusCode === 307) {
             clearInterval(poll);
             resolve();
@@ -113,17 +182,17 @@ function createWindow() {
     show: false,
   });
 
-  mainWindow.loadURL(`http://localhost:${PORT}`);
+  mainWindow.loadURL("http://127.0.0.1:" + PORT);
 
   // Show window when ready
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
   });
 
-  // Handle new window requests
+  // Handle new window requests (security hardened)
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    // Allow blank windows (used for print preview) and data: URLs
-    if (url === "about:blank" || url.startsWith("data:")) {
+    // Allow blank windows for print preview (used by window.open("", "_blank"))
+    if (url === "about:blank") {
       return {
         action: "allow",
         overrideBrowserWindowOptions: {
@@ -131,11 +200,20 @@ function createWindow() {
           height: 700,
           title: "Print Preview - LegalEase PH",
           autoHideMenuBar: true,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+          },
         },
       };
     }
-    // Open external links in system browser
-    if (url.startsWith("http")) {
+    // Block data: URLs in new windows (security fix - could contain arbitrary JS)
+    // Print preview uses about:blank + document.write instead
+    if (url.startsWith("data:")) {
+      return { action: "deny" };
+    }
+    // Only open HTTPS URLs in system browser (security fix - no HTTP, allowlist optional)
+    if (url.startsWith("https://")) {
       shell.openExternal(url);
     }
     return { action: "deny" };
@@ -162,33 +240,19 @@ function createSplashWindow() {
   });
 
   splash.loadURL(
-    `data:text/html;charset=utf-8,${encodeURIComponent(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <style>
-        body {
-          margin: 0; display: flex; align-items: center; justify-content: center;
-          height: 100vh; background: #1e3a5f; color: white; font-family: 'Segoe UI', sans-serif;
-          flex-direction: column; gap: 16px;
-        }
-        h1 { font-size: 28px; margin: 0; font-weight: 700; }
-        .subtitle { font-size: 14px; opacity: 0.7; }
-        .loader {
-          width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.2);
-          border-top-color: #d4a843; border-radius: 50%;
-          animation: spin 1s linear infinite;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-      </style>
-    </head>
-    <body>
-      <h1>LegalEase PH</h1>
-      <p class="subtitle">Starting application...</p>
-      <div class="loader"></div>
-    </body>
-    </html>
-  `)}`
+    "data:text/html;charset=utf-8," + encodeURIComponent([
+      "<!DOCTYPE html><html><head><style>",
+      "body { margin:0; display:flex; align-items:center; justify-content:center; height:100vh; background:#1e3a5f; color:white; font-family:'Segoe UI',sans-serif; flex-direction:column; gap:16px; }",
+      "h1 { font-size:28px; margin:0; font-weight:700; }",
+      ".subtitle { font-size:14px; opacity:0.7; }",
+      ".loader { width:40px; height:40px; border:3px solid rgba(255,255,255,0.2); border-top-color:#d4a843; border-radius:50%; animation:spin 1s linear infinite; }",
+      "@keyframes spin { to { transform:rotate(360deg); } }",
+      "</style></head><body>",
+      "<h1>LegalEase PH</h1>",
+      '<p class="subtitle">Starting application...</p>',
+      '<div class="loader"></div>',
+      "</body></html>",
+    ].join(""))
   );
 
   return splash;
@@ -197,6 +261,18 @@ function createSplashWindow() {
 app.whenReady().then(async () => {
   const splash = createSplashWindow();
 
+  // B3 fix: Check port availability before starting
+  const portFree = await isPortAvailable(PORT);
+  if (!portFree) {
+    splash.close();
+    dialog.showErrorBox(
+      "LegalEase PH",
+      "Port " + PORT + " is already in use. Another instance may be running.\n\nPlease close it and try again."
+    );
+    app.quit();
+    return;
+  }
+
   try {
     await startNextServer();
     createWindow();
@@ -204,23 +280,18 @@ app.whenReady().then(async () => {
   } catch (err) {
     console.error("Failed to start:", err);
     splash.close();
+    dialog.showErrorBox("LegalEase PH", "Failed to start: " + err.message);
     app.quit();
   }
 });
 
 app.on("window-all-closed", () => {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+  killServerProcess();
   app.quit();
 });
 
 app.on("before-quit", () => {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+  killServerProcess();
 });
 
 app.on("activate", () => {
